@@ -1,0 +1,167 @@
+---
+title: "Emergent constraint on beta-GPP"
+author: "Beni Stocker"
+date: "2023-03-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+```
+
+
+## Read data
+
+Data obtained by Trevor by email of 26 January 2022 (attachment `modelTerms.zip`). Unpacked and added to this repo.
+```{r}
+df_beta <- read_csv("../data/T_betaGPP.csv") |> 
+  pivot_longer(everything(), values_to = "beta", names_to = "model")
+
+df_sland <- read_csv("../data/T_Sland.csv") |> 
+  pivot_longer(everything(), values_to = "sland", names_to = "model")
+
+df <- df_beta |> 
+  left_join(df_sland, by = "model") |> 
+  
+  # remove row with missing value (for model VEGAS)
+  drop_na()
+```
+
+## Regression
+
+Define prediction error function based on methods in Cox et al., 2013.
+
+Add line for prediction error $\sigma_f(x)$ manually.
+```{r}
+# sum of square errors
+linmod <- lm(beta ~ sland, data = df)
+
+# prediction error (sigma_f)
+get_prediction_error <- function(x, x_mean, x_var, linmod){
+  sse <- sum(linmod$residuals^2)
+  s_squared <- (1 / (length(linmod$residuals) - 2)) * sse
+  out <- sqrt(s_squared) * sqrt(1 + 1/length(sse) + (x - x_mean)^2 / (length(sse) * x_var))
+  return(out)
+}
+
+# prediction +/- prediction error
+predict_range_upper <- function(x, linmod){
+  predict(linmod, data.frame(sland = x)) + 
+    get_prediction_error(x, 
+                         x_mean = mean(x),
+                         x_var = var(x),
+                         linmod)
+}
+predict_range_lower <- function(x, linmod){
+  predict(linmod, data.frame(sland = x)) -
+    get_prediction_error(x, 
+                         x_mean = mean(x),
+                         x_var = var(x),
+                         linmod)
+}
+
+df |> 
+  ggplot(aes(sland, beta)) + 
+  geom_point() +
+  geom_smooth(method = "lm", color = "red") +
+  geom_function(fun = function(x) predict_range_upper(x, linmod = linmod)) +
+  geom_function(fun = function(x) predict_range_lower(x, linmod = linmod)) +
+  theme_classic()
+```
+
+
+## Unconstrained distribution
+
+The unconstrained probability distribution of $y$ is given by a normal distribution with mean and standard deviations given by the vector of $\beta$ of the models.
+
+```{r}
+df |> 
+  ggplot() +
+  geom_histogram(aes(beta, ..density..), bins = 5, color = "black", fill = "grey70") +
+  stat_function(fun = dnorm, 
+                args = list(mean = mean(df$beta, na.rm = TRUE), 
+                            sd = sd(df$beta, na.rm = TRUE)),
+                color = "red") +
+  theme_classic()
+```
+
+## Distribution of S_land
+
+The land sink is assumed to be normally distributed with mean = X and SD = Y. For demo, using mean = 3 and SD = 0.1.
+
+@Trevor: Could you send me the updated data with cumulative Sland values from models and report the  mean and standard deviation of the Sland used for the constraint?
+
+```{r}
+prob_x <- function(x){
+  dnorm(x, mean = 3.0, sd = 0.1)
+}
+
+ggplot() +
+  geom_function( fun = prob_x) + 
+  xlim(0, 5)
+```
+
+## Constrained probability distribution
+
+$$
+P(y) = \int_{-\infty }^{+\infty} P(y|x) P(x)
+$$
+```{r}
+# P(y|x) is a Gaussian function with mean = prediction and variance = prediction error
+prob_y_given_x <- function(x, y, x_mean, x_var, linmod){
+  
+  # out <- dnorm(y, 
+  #              mean = predict(linmod, data.frame(sland = x)),
+  #              sd = get_prediction_error(x, x_mean, x_var, linmod))
+  
+  # or "manually":
+  f_x <- predict(linmod, data.frame(sland = x))
+  sigma_f <- get_prediction_error(x, x_mean, x_var, linmod)
+  out <- (1 / sqrt(2 * pi * sigma_f^2)) * exp(-(y - f_x)^2 / (2 * sigma_f^2))  # error in Cox formula: missing square
+  
+  return(out)
+}
+
+d_constrained_prob <- function(x, y, x_mean, x_var, linmod){
+  prob_y_given_x(x, y, x_mean, x_var, linmod) * prob_x(x)
+}
+
+constrained_prob <- function(y, x_mean, x_var, linmod){
+  integrate(d_constrained_prob, 
+            lower = -10, 
+            upper = 10, 
+            y = y, 
+            x_mean = x_mean, 
+            x_var = x_var, 
+            linmod = linmod
+            )$value
+}
+```
+
+Plot unconstrained (black) and constrained (red) probability distributions.
+```{r}
+# create values for constrained probability
+df_prob <- tibble(y = seq(from = -1, to = 2, by = 0.025)) |> 
+  rowwise() |> 
+  mutate(prob_y = constrained_prob(y, 
+                                   x_mean = mean(df$sland), 
+                                   x_var = var(df$sland), 
+                                   linmod = linmod))
+
+df |> 
+  ggplot() +
+  geom_histogram(aes(beta, ..density..), 
+                 bins = 30, 
+                 color = "black", 
+                 fill = "grey70") +
+  stat_function(fun = dnorm, 
+                args = list(mean = mean(df$beta, na.rm = TRUE), 
+                            sd = sd(df$beta, na.rm = TRUE)),
+                color = "black") +
+  geom_line(data = df_prob, aes(y, prob_y), color = "red") +
+  theme_classic()
+```
