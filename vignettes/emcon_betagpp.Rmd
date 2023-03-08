@@ -9,26 +9,31 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-```{r}
+Code for this is [here](https://github.com/stineb/emcon_keenan/blob/main/vignettes/emcon_betagpp.Rmd).
+
+```{r message=FALSE}
 library(tidyverse)
 ```
 
 
 ## Read data
 
-Data obtained by Trevor by email of 26 January 2022 (attachment `modelTerms.zip`). Unpacked and added to this repo.
-```{r}
-df_beta <- read_csv("../data/T_betaGPP.csv") |> 
-  pivot_longer(everything(), values_to = "beta", names_to = "model")
-
-df_sland <- read_csv("../data/T_Sland.csv") |> 
-  pivot_longer(everything(), values_to = "sland", names_to = "model")
-
-df <- df_beta |> 
-  left_join(df_sland, by = "model") |> 
+Data obtained by Trevor by email 7.3.2023. This excludes the results from the VEGAS model in order to reproduce results in the submitted version of the manuscript (for Nature CC).
+```{r message=FALSE}
+## NEW (NATURE CC) VERSION
+df <- read_csv("../data/SlandAndBetas.csv") |> 
+  rename(model = modelNames, sland = Sland_Cumulative, beta = betaGPP) |> 
   
-  # remove row with missing value (for model VEGAS)
-  drop_na()
+  # remove to reproduce exact numbers as in submitted ms
+  filter(!(model %in% c("VEGAS"))) |>
+
+  # add RS models' beta
+  bind_rows(
+    tibble(model = "MODIS", sland = NA, beta = 0.1672)
+  ) |> 
+  bind_rows(
+    tibble(model = "MPI", sland = NA, beta = 0.1625)
+  )
 ```
 
 ## Regression
@@ -36,15 +41,34 @@ df <- df_beta |>
 Define prediction error function based on methods in Cox et al., 2013.
 
 Add line for prediction error $\sigma_f(x)$ manually.
-```{r}
+```{r message=FALSE}
 # sum of square errors
-linmod <- lm(beta ~ sland, data = df)
+linmod <- lm(beta ~ sland, data = df |> drop_na())
+
+# Cox et al. use N, and not N-1 in denominator of variance. Why?
+coxvar <- function(vec){
+  vec <- vec[!is.na(vec)]
+  sum((vec - mean(vec))^2)/length(vec)
+}
 
 # prediction error (sigma_f)
 get_prediction_error <- function(x, x_mean, x_var, linmod){
-  sse <- sum(linmod$residuals^2)
-  s_squared <- (1 / (length(linmod$residuals) - 2)) * sse
-  out <- sqrt(s_squared) * sqrt(1 + 1/length(sse) + (x - x_mean)^2 / (length(sse) * x_var))
+  
+  # 95% CI (shown by geom_smooth())
+  out <- predict(linmod,
+                 newdata = data.frame(sland = x),
+                 se.fit = TRUE,
+                 interval = "none",
+                 type = "response")$se.fit
+
+  # # by hand following Cox et al., 2013 - not identical as with predict()!
+  # sse <- sum(linmod$residuals^2)
+  # s_squared <- (1 / (length(linmod$residuals) - 2)) * sse
+  # 
+  # # Cox et al. use 1 + ... in the formula for the prediction error. Why?
+  # # out <- sqrt(s_squared) * sqrt(1 + 1/length(sse) + (x - x_mean)^2 / (length(sse) * x_var))
+  # out <- sqrt(s_squared) * sqrt(1/length(sse) + (x - x_mean)^2 / (length(sse) * x_var))
+  
   return(out)
 }
 
@@ -53,14 +77,14 @@ predict_range_upper <- function(x, linmod){
   predict(linmod, data.frame(sland = x)) + 
     get_prediction_error(x, 
                          x_mean = mean(x),
-                         x_var = var(x),
+                         x_var = coxvar(x), #  var(x),
                          linmod)
 }
 predict_range_lower <- function(x, linmod){
   predict(linmod, data.frame(sland = x)) -
     get_prediction_error(x, 
                          x_mean = mean(x),
-                         x_var = var(x),
+                         x_var = coxvar(x), #  var(x),
                          linmod)
 }
 
@@ -71,38 +95,26 @@ df |>
   geom_function(fun = function(x) predict_range_upper(x, linmod = linmod)) +
   geom_function(fun = function(x) predict_range_lower(x, linmod = linmod)) +
   theme_classic()
+
+# get metrics
+out <- rbeni::analyse_modobs2(df, "sland", "beta")
+out$df_metrics |> filter(.metric == "cor")
 ```
 
+**Issues:**
 
-## Unconstrained distribution
-
-The unconstrained probability distribution of $y$ is given by a normal distribution with mean and standard deviations given by the vector of $\beta$ of the models.
-
-```{r}
-df |> 
-  ggplot() +
-  geom_histogram(aes(beta, ..density..), bins = 5, color = "black", fill = "grey70") +
-  stat_function(fun = dnorm, 
-                args = list(mean = mean(df$beta, na.rm = TRUE), 
-                            sd = sd(df$beta, na.rm = TRUE)),
-                color = "red") +
-  theme_classic()
-```
+- Something must be wrong about my "manual" prediction error calculation. It's based on Cox et al. for $\sigma_f(x)$ but doesn't seem to give the same as the built-in function (`predict()`), and is not the same as shown in the submitted ms. When using `predict()`, I get the same range of predicted plus/minus standard error as shown in our ms Fig. 2a (see black lines in figure above).
+- Cox et al. use $N$, and not $N-1$ in denominator of variance. Why?
+- Cox et al. use $1+...$ in the formula for $\sigma_f(x)$. Why?
 
 ## Distribution of S_land
 
-The land sink is assumed to be normally distributed with mean = X and SD = Y. For demo, using mean = 3 and SD = 0.1.
-
-@Trevor: Could you send me the updated data with cumulative Sland values from models and report the  mean and standard deviation of the Sland used for the constraint?
+The land sink is assumed to be normally distributed with $\mu$ = 92.13 and $\sigma$ = 17.04. 
 
 ```{r}
 prob_x <- function(x){
-  dnorm(x, mean = 3.0, sd = 0.1)
+  dnorm(x, mean = 92.13, sd = 17.04)
 }
-
-ggplot() +
-  geom_function( fun = prob_x) + 
-  xlim(0, 5)
 ```
 
 ## Constrained probability distribution
@@ -110,7 +122,8 @@ ggplot() +
 $$
 P(y) = \int_{-\infty }^{+\infty} P(y|x) P(x)
 $$
-```{r}
+
+```{r message=FALSE}
 # P(y|x) is a Gaussian function with mean = prediction and variance = prediction error
 prob_y_given_x <- function(x, y, x_mean, x_var, linmod){
   
@@ -121,7 +134,7 @@ prob_y_given_x <- function(x, y, x_mean, x_var, linmod){
   # or "manually":
   f_x <- predict(linmod, data.frame(sland = x))
   sigma_f <- get_prediction_error(x, x_mean, x_var, linmod)
-  out <- (1 / sqrt(2 * pi * sigma_f^2)) * exp(-(y - f_x)^2 / (2 * sigma_f^2))  # error in Cox formula: missing square
+  out <- (1 / sqrt(2 * pi * sigma_f^2)) * exp(-(y - f_x)^2 / (2 * sigma_f^2))  # error in Cox et al? missing square
   
   return(out)
 }
@@ -132,8 +145,8 @@ d_constrained_prob <- function(x, y, x_mean, x_var, linmod){
 
 constrained_prob <- function(y, x_mean, x_var, linmod){
   integrate(d_constrained_prob, 
-            lower = -10, 
-            upper = 10, 
+            lower = 0, 
+            upper = 200, 
             y = y, 
             x_mean = x_mean, 
             x_var = x_var, 
@@ -142,26 +155,112 @@ constrained_prob <- function(y, x_mean, x_var, linmod){
 }
 ```
 
-Plot unconstrained (black) and constrained (red) probability distributions.
-```{r}
+**Issues:**
+
+- Cox et al. use the following for the constrained probability:
+$$
+P(y|x) = \frac{1}{\sqrt{2\pi \sigma_f^2}} \exp{\left(-\frac{(y-f(x))^2}{2\sigma_f}\right)}
+$$
+  The Gaussian Normal distribution uses the variance ($\sigma_f^2$), not the standard deviation in the exponent of the exponential function. When using the standard deviation, I get a too wide constrained probability.
+
+
+Plot unconstrained (black) and constrained (brownish) probability distributions.
+```{r message=FALSE}
 # create values for constrained probability
-df_prob <- tibble(y = seq(from = -1, to = 2, by = 0.025)) |> 
+df_prob <- tibble(y = seq(from = 0, to = 1, by = 0.001)) |> 
   rowwise() |> 
   mutate(prob_y = constrained_prob(y, 
-                                   x_mean = mean(df$sland), 
-                                   x_var = var(df$sland), 
+                                   x_mean = mean(df$sland, na.rm = TRUE), 
+                                   x_var = var(df$sland, na.rm = TRUE), 
                                    linmod = linmod))
 
 df |> 
   ggplot() +
   geom_histogram(aes(beta, ..density..), 
-                 bins = 30, 
+                 bins = 12, 
                  color = "black", 
                  fill = "grey70") +
   stat_function(fun = dnorm, 
                 args = list(mean = mean(df$beta, na.rm = TRUE), 
                             sd = sd(df$beta, na.rm = TRUE)),
+                color = "grey40", 
+                linetype = "dashed") +
+  stat_function(fun = dnorm, 
+                args = list(mean = mean(df |> 
+                                          drop_na() |> 
+                                          pull(beta)
+                                        , na.rm = TRUE), 
+                            sd = sd(df |> 
+                                          drop_na() |> 
+                                          pull(beta)
+                                        , na.rm = TRUE)),
                 color = "black") +
-  geom_line(data = df_prob, aes(y, prob_y), color = "red") +
-  theme_classic()
+  geom_line(data = df_prob, aes(y, prob_y), color = "darkgoldenrod") +
+  theme_classic() +
+  xlim(0,1)
 ```
+
+**Issues:**
+
+- It seems like the constrained probability here is somewhat more strongly constrained (narrower) than in our submitted ms. Why would that be?
+
+## Bootstrapping
+
+```{r}
+nboot <- 5000
+
+# sample Sland
+vec_sland <- rnorm(nboot, mean = 92.13, sd = 17.04)
+
+# function to generate a sample of predictions, given Sland
+get_vec_beta <- function(x, n_beta){
+  
+  # predict beta, given sland
+  pred_beta <- predict(linmod,
+    newdata = data.frame(sland = x),
+    se.fit = TRUE, 
+    level = 0.95,
+    interval = "none",
+    type = "response"
+    )
+  
+  # generate vector of predictions
+  rnorm(n_beta, mean = pred_beta$fit, sd = pred_beta$se.fit)
+}
+
+# generate beta-prediction samples of Sland samples and convert to vector
+vec_beta <- purrr::map(as.list(vec_sland),
+                       ~get_vec_beta(., n_beta = nboot)) |> 
+  unlist()
+```
+
+Plot bootstrapped: Brownish is constrained distribution of predictions. Solid brownish line is the based on the bootstrapping, dotted is the quasi-analytical curve (same as in plot above).
+```{r}
+df |> 
+  ggplot() +
+  geom_histogram(aes(beta, ..density..), 
+                 bins = 12, 
+                 color = "black", 
+                 fill = "grey70") +
+  stat_function(fun = dnorm, 
+                args = list(mean = mean(df$beta, na.rm = TRUE), 
+                            sd = sd(df$beta, na.rm = TRUE)),
+                color = "grey40", 
+                linetype = "dashed") +
+  stat_function(fun = dnorm, 
+                args = list(mean = mean(df |> 
+                                          drop_na() |> 
+                                          pull(beta)
+                                        , na.rm = TRUE), 
+                            sd = sd(df |> 
+                                          drop_na() |> 
+                                          pull(beta)
+                                        , na.rm = TRUE)),
+                color = "black") +
+  geom_density(data = tibble(beta = vec_beta), aes(beta, ..density..), color = "darkgoldenrod") +
+  geom_line(data = df_prob, aes(y, prob_y), color = "darkgoldenrod", linetype = "dotted") +
+  theme_classic() +
+  xlim(0,1)
+```
+
+The bootstrapping-based approach is (almost, but not perfectly) consistent with the quasi-analytical approach using `integrate()`, and using `predict()` for getting the prediction error.
