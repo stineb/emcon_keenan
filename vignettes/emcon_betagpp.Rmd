@@ -38,37 +38,38 @@ df <- read_csv("../data/SlandAndBetas.csv") |>
 
 ## Regression
 
-Define prediction error function based on methods in Cox et al., 2013.
+Define prediction error function based on methods in Cox et al., 2018 (and 2013).
 
 Add line for prediction error $\sigma_f(x)$ manually.
 ```{r message=FALSE}
 # sum of square errors
 linmod <- lm(beta ~ sland, data = df |> drop_na())
 
-# Cox et al. use N, and not N-1 in denominator of variance. Why?
+# Cox et al., 2013 use N, and not N-1 in denominator of variance. Why?
 coxvar <- function(vec){
   vec <- vec[!is.na(vec)]
   sum((vec - mean(vec))^2)/length(vec)
 }
 
 # prediction error (sigma_f)
-get_prediction_error <- function(x, x_mean, x_var, linmod){
+get_prediction_error <- function(x, linmod, x_mean = NA, x_var = NA, use_method = "default"){
   
-  # 95% CI (shown by geom_smooth())
-  out <- predict(linmod,
-                 newdata = data.frame(sland = x),
-                 se.fit = TRUE,
-                 interval = "none",
-                 type = "response")$se.fit
+  if (use_method == "default"){
+    # 95% CI (shown by geom_smooth())
+    out <- predict(linmod,
+                   newdata = data.frame(sland = x),
+                   se.fit = TRUE,
+                   interval = "none",
+                   type = "response")$se.fit
+      
+  } else if (use_method == "cox18"){
+    # Calculate prediction error following Cox et al., 2018, but omitting the '1 + ...' in the square root
+    sse <- sum(linmod$residuals^2)
+    s_squared <- (1 / (length(linmod$residuals) - 2)) * sse  # Eq. 9
+    out <- sqrt(s_squared) * sqrt( 1/length(linmod$residuals) + (x - x_mean)^2 / (length(linmod$residuals) * x_var) )
+      
+  }
 
-  # # by hand following Cox et al., 2013 - not identical as with predict()!
-  # sse <- sum(linmod$residuals^2)
-  # s_squared <- (1 / (length(linmod$residuals) - 2)) * sse
-  # 
-  # # Cox et al. use 1 + ... in the formula for the prediction error. Why?
-  # # out <- sqrt(s_squared) * sqrt(1 + 1/length(sse) + (x - x_mean)^2 / (length(sse) * x_var))
-  # out <- sqrt(s_squared) * sqrt(1/length(sse) + (x - x_mean)^2 / (length(sse) * x_var))
-  
   return(out)
 }
 
@@ -76,24 +77,42 @@ get_prediction_error <- function(x, x_mean, x_var, linmod){
 predict_range_upper <- function(x, linmod){
   predict(linmod, data.frame(sland = x)) + 
     get_prediction_error(x, 
-                         x_mean = mean(x),
-                         x_var = coxvar(x), #  var(x),
                          linmod)
 }
 predict_range_lower <- function(x, linmod){
   predict(linmod, data.frame(sland = x)) -
     get_prediction_error(x, 
-                         x_mean = mean(x),
-                         x_var = coxvar(x), #  var(x),
                          linmod)
 }
 
+# prediction +/- prediction error
+predict_range_upper_cox18 <- function(x, linmod){
+  predict(linmod, data.frame(sland = x)) + 
+    get_prediction_error(x, 
+                         linmod,
+                         x_mean = mean(x),
+                         x_var = coxvar(x),
+                         use_method = "cox18")
+}
+predict_range_lower_cox18 <- function(x, linmod){
+  predict(linmod, data.frame(sland = x)) -
+    get_prediction_error(x, 
+                         linmod,
+                         x_mean = mean(x),
+                         x_var = coxvar(x),
+                         use_method = "cox18")
+}
+
+# black line: prediction error based on built-in function
+# blue line: prediction error based on Cox et al., 2018 (without the 1 + ...)
 df |> 
   ggplot(aes(sland, beta)) + 
   geom_point() +
-  geom_smooth(method = "lm", color = "red") +
+  geom_smooth(method = "lm", color = "red", se = FALSE) +
   geom_function(fun = function(x) predict_range_upper(x, linmod = linmod)) +
   geom_function(fun = function(x) predict_range_lower(x, linmod = linmod)) +
+  geom_function(fun = function(x) predict_range_upper_cox18(x, linmod = linmod), color = "royalblue", linetype = "dashed") +
+  geom_function(fun = function(x) predict_range_lower_cox18(x, linmod = linmod), color = "royalblue", linetype = "dashed") +
   theme_classic()
 
 # get metrics
@@ -103,9 +122,8 @@ out$df_metrics |> filter(.metric == "cor")
 
 **Issues:**
 
-- Something must be wrong about my "manual" prediction error calculation. It's based on Cox et al. for $\sigma_f(x)$ but doesn't seem to give the same as the built-in function (`predict()`), and is not the same as shown in the submitted ms. When using `predict()`, I get the same range of predicted plus/minus standard error as shown in our ms Fig. 2a (see black lines in figure above).
-- Cox et al. use $N$, and not $N-1$ in denominator of variance. Why?
-- Cox et al. use $1+...$ in the formula for $\sigma_f(x)$. Why?
+- Cox et al. (2013 and 2018) use $N$, and not $N-1$ in denominator of variance. This is because you can use N when you are calculating exactly the variance of a known population, and use N-1 when estimating the variance of a population based on a sample (thanks, Trevor).
+- Cox et al. (2013 and 2018) use $1 + ...$ in the formula for $\sigma_f(x)$. Unclear why. This is omitted here.
 
 ## Distribution of S_land
 
@@ -120,7 +138,7 @@ prob_x <- function(x){
 ## Constrained probability distribution
 
 $$
-P(y) = \int_{-\infty }^{+\infty} P(y|x) P(x)
+P(y) = \int_{-\infty }^{+\infty} P(y|x) P(x) \; dx
 $$
 
 ```{r message=FALSE}
@@ -133,8 +151,8 @@ prob_y_given_x <- function(x, y, x_mean, x_var, linmod){
   
   # or "manually":
   f_x <- predict(linmod, data.frame(sland = x))
-  sigma_f <- get_prediction_error(x, x_mean, x_var, linmod)
-  out <- (1 / sqrt(2 * pi * sigma_f^2)) * exp(-(y - f_x)^2 / (2 * sigma_f^2))  # error in Cox et al? missing square
+  sigma_f <- get_prediction_error(x, linmod, x_mean, x_var, use_method = "cox18")
+  out <- (1 / sqrt(2 * pi * sigma_f^2)) * exp(-(y - f_x)^2 / (2 * sigma_f^2))
   
   return(out)
 }
@@ -157,12 +175,10 @@ constrained_prob <- function(y, x_mean, x_var, linmod){
 
 **Issues:**
 
-- Cox et al. use the following for the constrained probability:
+- Cox et al. 2018 use the following for the constrained probability. Note: The variance is used in the denominator of the exponent, not the standard deviation (as probably erroneously described in Cox et al., 2013):
 $$
-P(y|x) = \frac{1}{\sqrt{2\pi \sigma_f^2}} \exp{\left(-\frac{(y-f(x))^2}{2\sigma_f}\right)}
+P(y|x) = \frac{1}{\sqrt{2\pi \sigma_f^2}} \; \exp{\left(-\frac{(y-f(x))^2}{2\sigma_f^2}\right)}
 $$
-  The Gaussian Normal distribution uses the variance ($\sigma_f^2$), not the standard deviation in the exponent of the exponential function. When using the standard deviation, I get a too wide constrained probability.
-
 
 Plot unconstrained (black) and constrained (brownish) probability distributions.
 ```{r message=FALSE}
@@ -200,10 +216,6 @@ df |>
   xlim(0,1)
 ```
 
-**Issues:**
-
-- It seems like the constrained probability here is somewhat more strongly constrained (narrower) than in our submitted ms. Why would that be?
-
 ## Bootstrapping
 
 ```{r}
@@ -213,7 +225,7 @@ nboot <- 5000
 vec_sland <- rnorm(nboot, mean = 92.13, sd = 17.04)
 
 # function to generate a sample of predictions, given Sland
-get_vec_beta <- function(x, n_beta){
+get_vec_beta_given_sland <- function(x, n_beta){
   
   # predict beta, given sland
   pred_beta <- predict(linmod,
@@ -230,7 +242,7 @@ get_vec_beta <- function(x, n_beta){
 
 # generate beta-prediction samples of Sland samples and convert to vector
 vec_beta <- purrr::map(as.list(vec_sland),
-                       ~get_vec_beta(., n_beta = nboot)) |> 
+                       ~get_vec_beta_given_sland(., n_beta = nboot)) |> 
   unlist()
 ```
 
@@ -258,9 +270,10 @@ df |>
                                         , na.rm = TRUE)),
                 color = "black") +
   geom_density(data = tibble(beta = vec_beta), aes(beta, ..density..), color = "darkgoldenrod") +
-  geom_line(data = df_prob, aes(y, prob_y), color = "darkgoldenrod", linetype = "dotted") +
+  geom_line(data = df_prob, aes(y, prob_y), color = "darkgoldenrod4", linetype = "dotted") +
   theme_classic() +
   xlim(0,1)
 ```
 
-The bootstrapping-based approach is (almost, but not perfectly) consistent with the quasi-analytical approach using `integrate()`, and using `predict()` for getting the prediction error.
+The bootstrapping-based approach is perfectly consistent with the quasi-analytical approach using `integrate()`, and using the Cox et al. (2018) formulae (but omitting the ‘1 + …’!) for getting the prediction error.
+
